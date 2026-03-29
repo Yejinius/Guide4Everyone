@@ -1,0 +1,83 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "User ID" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "displayName"]
+    },
+    "Manual": {
+      "title": "Manual",
+      "description": "A saved manual (PDF metadata and OCR text)",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string" },
+        "fileName": { "type": "string" },
+        "productName": { "type": "string" },
+        "driveFileId": { "type": "string" },
+        "ocrText": { "type": "string" },
+        "ocrStatus": { "type": "string", "enum": ["pending", "completed", "failed"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "fileName", "productName", "createdAt"]
+    },
+    "SharedManual": {
+      "title": "SharedManual",
+      "description": "A manual shared to the community warehouse",
+      "type": "object",
+      "properties": {
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "authorPhoto": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "fileName": { "type": "string" },
+        "downloadUrl": { "type": "string" },
+        "likesCount": { "type": "number" },
+        "commentsCount": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["authorId", "title", "fileName", "downloadUrl", "createdAt"]
+    },
+    "Comment": {
+      "title": "Comment",
+      "description": "A comment on a shared manual",
+      "type": "object",
+      "properties": {
+        "sharedManualId": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "authorPhoto": { "type": "string" },
+        "content": { "type": "string" },
+        "parentId": { "type": "string", "description": "ID of parent comment if this is a reply" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["sharedManualId", "authorId", "content", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User profiles"
+    },
+    "/manuals/{manualId}": {
+      "schema": { "$ref": "#/entities/Manual" },
+      "description": "User's saved manuals"
+    },
+    "/shared_manuals/{sharedId}": {
+      "schema": { "$ref": "#/entities/SharedManual" },
+      "description": "Community shared manuals"
+    },
+    "/comments/{commentId}": {
+      "schema": { "$ref": "#/entities/Comment" },
+      "description": "Comments on shared manuals"
+    }
+  }
+}
