@@ -91,7 +91,8 @@ export function MainModal() {
       }
       
       toast.success('OCR 처리가 완료되었습니다.', {
-        position: 'top-center',
+        duration: 5000,
+        position: 'top-right',
       });
     } catch (error) {
       console.error('Manual OCR failed:', error);
@@ -101,7 +102,8 @@ export function MainModal() {
         handleFirestoreError(e, OperationType.UPDATE, 'manuals');
       }
       toast.error('OCR 처리에 실패했습니다. 파일이 손상되었거나 텍스트를 추출할 수 없습니다.', {
-        position: 'top-center',
+        duration: 5000,
+        position: 'top-right',
       });
     } finally {
       setProcessingOcrId(null);

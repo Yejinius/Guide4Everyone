@@ -19,6 +19,28 @@ import { handleFirestoreError, OperationType } from '../utils/errorHandling';
 
 pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
+// Global queue for OCR tasks to prevent browser freeze
+const ocrQueue: (() => Promise<void>)[] = [];
+let isOcrProcessing = false;
+
+const processOcrQueue = async () => {
+  if (isOcrProcessing) return;
+  isOcrProcessing = true;
+  
+  while (ocrQueue.length > 0) {
+    const task = ocrQueue.shift();
+    if (task) {
+      try {
+        await task();
+      } catch (e) {
+        console.error('OCR Queue task failed:', e);
+      }
+    }
+  }
+  
+  isOcrProcessing = false;
+};
+
 export function ViewerModal() {
   const { user, driveToken, setDriveToken, selectedManual, setActiveModal, setSelectedManual } = useAppStore();
   
@@ -70,27 +92,41 @@ export function ViewerModal() {
     standardFontDataUrl: `https://unpkg.com/pdfjs-dist@${pdfjs.version}/standard_fonts/`
   }), []);
 
+  const prevManualIdRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (selectedManual) {
-      setProductName('productName' in selectedManual ? selectedManual.productName : selectedManual.title);
-      setOcrText('ocrText' in selectedManual ? selectedManual.ocrText : '');
-      setPageNumber(1);
-      
-      if (isSharedManual) {
-        setDriveStep('viewer');
-        // Fetch shared manual from Storage URL
-        loadPdfFromUrl((selectedManual as SharedManual).downloadUrl);
-      } else if ('driveFileId' in selectedManual && selectedManual.driveFileId) {
-        if (driveToken) {
+      if (prevManualIdRef.current !== selectedManual.id) {
+        setProductName('productName' in selectedManual ? selectedManual.productName : selectedManual.title);
+        setOcrText('ocrText' in selectedManual ? selectedManual.ocrText : '');
+        setPageNumber(1);
+        setNumPages(null);
+        setPdfFile(null);
+        
+        if (isSharedManual) {
           setDriveStep('viewer');
-          loadPdfFromDrive(selectedManual.driveFileId);
-        } else {
-          // Need to re-authenticate to view Drive file
-          setDriveStep('auth');
-          setPdfFile(null); // Ensure viewer doesn't show blank space
+          // Fetch shared manual from Storage URL
+          loadPdfFromUrl((selectedManual as SharedManual).downloadUrl);
+        } else if ('driveFileId' in selectedManual && selectedManual.driveFileId) {
+          if (driveToken) {
+            setDriveStep('viewer');
+            loadPdfFromDrive(selectedManual.driveFileId);
+          } else {
+            // Need to re-authenticate to view Drive file
+            setDriveStep('auth');
+            setPdfFile(null); // Ensure viewer doesn't show blank space
+          }
+        }
+        prevManualIdRef.current = selectedManual.id;
+      } else {
+        // Only update text/name if it's the same manual (e.g., OCR finished)
+        setProductName('productName' in selectedManual ? selectedManual.productName : selectedManual.title);
+        if ('ocrText' in selectedManual && selectedManual.ocrText) {
+          setOcrText(selectedManual.ocrText);
         }
       }
     } else {
+      prevManualIdRef.current = null;
       if (driveToken) {
         setDriveStep('folders');
         loadFolders(driveToken);
@@ -101,6 +137,26 @@ export function ViewerModal() {
   }, [selectedManual, driveToken]);
 
   // Load comments if it's a shared manual
+  useEffect(() => {
+    if (!selectedManual || isSharedManual) return;
+    
+    const unsubscribe = onSnapshot(doc(db, 'manuals', selectedManual.id), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.ocrStatus === 'completed' && data.ocrText) {
+          setOcrText(data.ocrText);
+          setSelectedManual({ id: docSnap.id, ...data } as Manual);
+        } else if (data.ocrStatus === 'failed') {
+          setSelectedManual({ id: docSnap.id, ...data } as Manual);
+        }
+      }
+    }, (error) => {
+      console.error("Error listening to manual updates:", error);
+    });
+    
+    return () => unsubscribe();
+  }, [selectedManual?.id, isSharedManual]);
+
   useEffect(() => {
     if (!isSharedManual || !selectedManual) return;
     const q = query(
@@ -188,21 +244,16 @@ export function ViewerModal() {
       return;
     }
 
-    if (selectionMode) {
-      setSelectedItems(prev => {
-        const newSet = new Set(prev);
-        if (newSet.has(id)) {
-          newSet.delete(id);
-        } else {
-          newSet.add(id);
-        }
-        return newSet;
-      });
-    } else {
-      setProductName(file.name.replace('.pdf', '').trim());
-      setCurrentFileId(id);
-      loadPdfFromDrive(id);
-    }
+    setSelectionMode(true);
+    setSelectedItems(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(id)) {
+        newSet.delete(id);
+      } else {
+        newSet.add(id);
+      }
+      return newSet;
+    });
   };
 
   const handlePointerLeave = () => {
@@ -228,7 +279,7 @@ export function ViewerModal() {
       
       toast.success(`파일 '${fileName}'의 OCR이 준비되었습니다.`, {
         duration: 5000,
-        position: 'top-center',
+        position: 'top-right',
       });
     } catch (error) {
       console.error(`Background OCR failed for ${docId}:`, error);
@@ -241,7 +292,7 @@ export function ViewerModal() {
       }
       toast.error(`파일 '${fileName}'의 OCR 처리에 실패했습니다.`, {
         duration: 5000,
-        position: 'top-center',
+        position: 'top-right',
       });
     }
   };
@@ -261,7 +312,8 @@ export function ViewerModal() {
 
     setIsProcessing(true);
     try {
-      const importPromises = filesToImport.map(async (file) => {
+      const importedIds: string[] = [];
+      for (const file of filesToImport) {
         const yyMMddHH = format(new Date(), 'yyMMddHH');
         const baseName = (file.name || '').replace('.pdf', '').trim();
         const productName = (baseName || '설명서').substring(0, 250);
@@ -285,23 +337,22 @@ export function ViewerModal() {
           throw e; // rethrow to be caught by outer catch
         }
         
-        // Trigger background OCR asynchronously without awaiting
-        processBackgroundOCR(docRef.id, file.id, driveToken, baseName);
+        // Trigger background OCR asynchronously via queue
+        ocrQueue.push(() => processBackgroundOCR(docRef.id, file.id, driveToken, baseName));
+        processOcrQueue();
         
-        return docRef.id;
-      });
-
-      await Promise.all(importPromises);
+        importedIds.push(docRef.id);
+      }
       
-      toast.info(`${filesToImport.length}개의 파일을 가져왔습니다. 백그라운드에서 OCR 처리가 진행됩니다. 다른 화면으로 이동하셔도 됩니다.`, {
+      toast.info(`${importedIds.length}개의 파일을 가져왔습니다. 백그라운드에서 OCR 처리가 진행됩니다. 다른 화면으로 이동하셔도 됩니다.`, {
         duration: 5000,
-        position: 'top-center',
+        position: 'top-right',
       });
       setActiveModal('main');
     } catch (error: any) {
       console.error('Import error:', error);
       toast.error(`파일 가져오기 중 오류가 발생했습니다: ${error?.message || '알 수 없는 오류'}`, {
-        position: 'top-center',
+        position: 'top-right',
       });
     } finally {
       setIsProcessing(false);
@@ -315,13 +366,11 @@ export function ViewerModal() {
     try {
       const blob = await downloadDriveFile(fileId, driveToken!);
       const url = URL.createObjectURL(blob);
-      setPdfFile(url);
       setPageNumber(1);
-      
+      setNumPages(null);
+      setPdfFile(url);
       if (!selectedManual) {
-        // Extract OCR if it's a new import
-        const text = await extractTextFromPdf(blob);
-        setOcrText(text);
+        setOcrText(''); // Reset OCR text for preview
       }
     } catch (error) {
       console.error(error);
@@ -338,8 +387,9 @@ export function ViewerModal() {
     try {
       const response = await fetch(url);
       const blob = await response.blob();
-      setPdfFile(URL.createObjectURL(blob));
       setPageNumber(1);
+      setNumPages(null);
+      setPdfFile(URL.createObjectURL(blob));
     } catch (error) {
       console.error(error);
       toast.error('공유된 PDF 파일을 불러오는데 실패했습니다.', {
@@ -351,7 +401,7 @@ export function ViewerModal() {
   };
 
   const handleSave = async () => {
-    if (!user || !pdfFile || !productName.trim()) return;
+    if (!user || !pdfFile || !productName.trim() || !currentFileId) return;
     
     setIsProcessing(true);
     try {
@@ -363,14 +413,11 @@ export function ViewerModal() {
         ownerId: user.uid,
         fileName: newFileName,
         productName: safeProductName,
-        ocrText: ocrText,
-        ocrStatus: ocrText.trim() ? 'completed' : 'failed',
-        createdAt: serverTimestamp()
+        ocrText: '',
+        ocrStatus: 'pending',
+        createdAt: serverTimestamp(),
+        driveFileId: currentFileId
       };
-      
-      if (currentFileId) {
-        newManual.driveFileId = currentFileId;
-      }
       
       let docRef;
       try {
@@ -379,14 +426,21 @@ export function ViewerModal() {
         handleFirestoreError(e, OperationType.CREATE, 'manuals');
         throw e;
       }
+      
+      // Trigger background OCR asynchronously via queue
+      ocrQueue.push(() => processBackgroundOCR(docRef.id, currentFileId, driveToken!, safeProductName));
+      processOcrQueue();
+      
       setSelectedManual({ id: docRef.id, ...newManual } as Manual);
-      toast.success('설명서가 성공적으로 저장되었습니다.', {
-        position: 'top-center',
+      toast.success('설명서가 성공적으로 저장되었습니다. 백그라운드에서 OCR 처리가 진행됩니다.', {
+        duration: 5000,
+        position: 'top-right',
       });
     } catch (error) {
       console.error(error);
       toast.error('저장 중 오류가 발생했습니다.', {
-        position: 'top-center',
+        duration: 5000,
+        position: 'top-right',
       });
     } finally {
       setIsProcessing(false);
@@ -396,49 +450,65 @@ export function ViewerModal() {
   const handleShare = async () => {
     if (!user || !selectedManual || !pdfFile) return;
     
-    setIsProcessing(true);
-    try {
-      // 1. Fetch Blob from current object URL
-      const response = await fetch(pdfFile as string);
-      const blob = await response.blob();
-      
-      // 2. Upload to Firebase Storage
-      const storageRef = ref(storage, `shared_manuals/${Date.now()}_${selectedManual.fileName}`);
-      await uploadBytes(storageRef, blob);
-      const downloadUrl = await getDownloadURL(storageRef);
-      
-      // 3. Save metadata to Firestore
-      const newSharedManual = {
-        authorId: user.uid,
-        authorName: (user.displayName || '익명').substring(0, 100),
-        authorPhoto: user.photoURL || '',
-        title: ('productName' in selectedManual ? selectedManual.productName : selectedManual.title).substring(0, 250),
-        description: '공유된 설명서입니다.',
-        fileName: selectedManual.fileName.substring(0, 300),
-        downloadUrl: downloadUrl,
-        likesCount: 0,
-        commentsCount: 0,
-        createdAt: serverTimestamp()
-      };
-      
+    // Start background process
+    toast.info('공유창고에 업로드 중입니다. 백그라운드에서 진행됩니다.', {
+      duration: 5000,
+      position: 'top-right',
+    });
+    
+    // Don't block UI
+    (async () => {
       try {
-        await addDoc(collection(db, 'shared_manuals'), newSharedManual);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.CREATE, 'shared_manuals');
-        throw e;
+        console.log('Starting share process...');
+        // 1. Fetch Blob from current object URL
+        const response = await fetch(pdfFile as string);
+        const blob = await response.blob();
+        console.log('Blob fetched, size:', blob.size);
+        
+        // 2. Upload to Firebase Storage
+        const storageRef = ref(storage, `shared_manuals/${Date.now()}_${selectedManual.fileName}`);
+        console.log('Uploading to Storage...');
+        await uploadBytes(storageRef, blob);
+        console.log('Upload complete, getting download URL...');
+        const downloadUrl = await getDownloadURL(storageRef);
+        
+        // 3. Save metadata to Firestore
+        console.log('Saving metadata to Firestore...');
+        const newSharedManual = {
+          authorId: user.uid,
+          authorName: (user.displayName || '익명').substring(0, 100),
+          authorPhoto: user.photoURL || '',
+          title: ('productName' in selectedManual ? selectedManual.productName : selectedManual.title).substring(0, 250),
+          description: '공유된 설명서입니다.',
+          fileName: selectedManual.fileName.substring(0, 300),
+          downloadUrl: downloadUrl,
+          likesCount: 0,
+          commentsCount: 0,
+          createdAt: serverTimestamp()
+        };
+        
+        try {
+          await addDoc(collection(db, 'shared_manuals'), newSharedManual);
+          console.log('Metadata saved successfully.');
+        } catch (e) {
+          handleFirestoreError(e, OperationType.CREATE, 'shared_manuals');
+          throw e;
+        }
+        toast.success('설명서가 공유창고에 등록되었습니다.', {
+          duration: 5000,
+          position: 'top-right',
+        });
+      } catch (error) {
+        console.error('Share process failed:', error);
+        toast.error('공유 중 오류가 발생했습니다. 개발자 도구(F12)의 콘솔을 확인해주세요.', {
+          duration: 5000,
+          position: 'top-right',
+        });
       }
-      toast.success('설명서가 공유창고에 등록되었습니다.', {
-        position: 'top-center',
-      });
-      setActiveModal('warehouse');
-    } catch (error) {
-      console.error(error);
-      toast.error('공유 중 오류가 발생했습니다.', {
-        position: 'top-center',
-      });
-    } finally {
-      setIsProcessing(false);
-    }
+    })();
+    
+    // Immediately close modal or just let user continue
+    setActiveModal('warehouse');
   };
 
   const handleSearch = () => {
@@ -448,7 +518,7 @@ export function ViewerModal() {
     }
     
     const results: {page: number, text: string}[] = [];
-    const pages = ocrText.split('\n\n');
+    const pages = ocrText.split('\n---PAGE_BREAK---\n');
     
     pages.forEach((pageText, index) => {
       if (pageText.toLowerCase().includes(searchQuery.toLowerCase())) {
@@ -814,14 +884,33 @@ export function ViewerModal() {
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-                  className="bg-slate-50 border-slate-200 rounded-xl h-12"
+                  disabled={selectedManual && 'ocrStatus' in selectedManual && selectedManual.ocrStatus === 'pending'}
+                  className="bg-slate-50 border-slate-200 rounded-xl h-12 disabled:opacity-50"
                 />
-                <Button onClick={handleSearch} className="bg-slate-900 text-white hover:bg-slate-800 rounded-xl h-12 px-6 font-bold shadow-sm">검색</Button>
+                <Button 
+                  onClick={handleSearch} 
+                  disabled={selectedManual && 'ocrStatus' in selectedManual && selectedManual.ocrStatus === 'pending'}
+                  className="bg-slate-900 text-white hover:bg-slate-800 rounded-xl h-12 px-6 font-bold shadow-sm disabled:opacity-50"
+                >
+                  검색
+                </Button>
               </div>
             </div>
             
             <div className="flex-1 overflow-y-auto p-6 bg-slate-50">
-              {searchResults.length > 0 ? (
+              {selectedManual && 'ocrStatus' in selectedManual && selectedManual.ocrStatus === 'pending' ? (
+                <div className="text-center py-20 text-amber-500">
+                  <Loader2 size={40} className="animate-spin mx-auto mb-4 opacity-50" strokeWidth={1.5} />
+                  <p className="font-bold text-lg text-amber-600 mb-2">백그라운드에서 OCR 처리 중입니다.</p>
+                  <p className="text-sm font-medium text-amber-500/80 leading-relaxed">잠시 후 검색이 가능해집니다.<br/>문서를 계속 보셔도 됩니다.</p>
+                </div>
+              ) : selectedManual && 'ocrStatus' in selectedManual && selectedManual.ocrStatus === 'failed' ? (
+                <div className="text-center py-20 text-rose-400">
+                  <FileText size={40} className="mx-auto mb-4 opacity-30" strokeWidth={1.5} />
+                  <p className="font-bold text-lg text-rose-500 mb-2">텍스트를 추출할 수 없습니다.</p>
+                  <p className="text-sm font-medium text-rose-400/80 leading-relaxed">이미지로만 구성된 문서이거나<br/>손상된 파일일 수 있습니다.</p>
+                </div>
+              ) : searchResults.length > 0 ? (
                 <div className="space-y-4">
                   <p className="text-xs font-bold text-slate-500 mb-5 uppercase tracking-widest">검색 결과 {searchResults.length}건</p>
                   {searchResults.map((result, idx) => (
